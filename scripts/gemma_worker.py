@@ -6,6 +6,7 @@ Exit codes:
     1  model response did not contain acceptable code
     2  configuration, argument, backend, or network error
     3  generated code failed validation
+    4  streaming interrupted; partial response saved separately
 """
 import argparse
 import dataclasses
@@ -50,6 +51,18 @@ LANGUAGE_ALIASES = {
 class ValidationResult:
     status: str
     message: str = ""
+
+
+class BackendError(Exception):
+    """A provider reported a permanent backend/protocol failure."""
+
+
+class StreamInterrupted(Exception):
+    """Streaming was interrupted; partial contains only already-received content."""
+
+    def __init__(self, partial):
+        super().__init__("stream interrupted")
+        self.partial = partial
 
 
 def load_config():
@@ -106,6 +119,141 @@ def call_openai(base_url, model, prompt, options, timeout, api_key=None):
         ],
     }, timeout, api_key)
     return data["choices"][0]["message"]["content"]
+
+
+def iter_ollama_ndjson(lines):
+    """Yield decoded events from Ollama's newline-delimited JSON stream."""
+    for raw in lines:
+        line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        line = line.strip()
+        if line:
+            yield json.loads(line)
+
+
+def iter_openai_sse(lines):
+    """Yield decoded OpenAI-compatible SSE events with proper event framing."""
+    data_lines = []
+    for raw in lines:
+        line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        line = line.rstrip("\r\n")
+        if not line:
+            if data_lines:
+                payload = "\n".join(data_lines)
+                data_lines = []
+                if payload == "[DONE]":
+                    return
+                yield json.loads(payload)
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+            if value == "[DONE]" and not data_lines:
+                return
+            data_lines.append(value)
+    if data_lines:
+        payload = "\n".join(data_lines)
+        if payload != "[DONE]":
+            yield json.loads(payload)
+
+
+def ollama_event_content(event):
+    error = event.get("error")
+    if error:
+        raise BackendError(str(error))
+    message = event.get("message")
+    return message.get("content", "") if isinstance(message, dict) else ""
+
+
+def openai_event_content(event):
+    error = event.get("error")
+    if error:
+        message = error.get("message") if isinstance(error, dict) else error
+        raise BackendError(str(message))
+    choices = event.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    delta = choices[0].get("delta")
+    return delta.get("content", "") if isinstance(delta, dict) else ""
+
+
+def collect_stream(events, content_from_event):
+    """Collect and display stream chunks, retaining partial data on SIGINT."""
+    chunks = []
+    final_event = {}
+    try:
+        for event in events:
+            final_event = event
+            content = content_from_event(event)
+            if content:
+                chunks.append(content)
+                print(content, end="", file=sys.stderr, flush=True)
+            if event.get("done"):
+                break
+    except KeyboardInterrupt as exc:
+        raise StreamInterrupted("".join(chunks)) from exc
+    if chunks:
+        print(file=sys.stderr)
+    return "".join(chunks), final_event
+
+
+def _stream_request(url, payload, timeout, parser, content_from_event, api_key=None):
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return collect_stream(parser(response), content_from_event)
+
+
+def call_ollama_stream(base_url, model, prompt, options, timeout):
+    return _stream_request(
+        base_url.rstrip("/") + "/api/chat",
+        {
+            "model": model,
+            "stream": True,
+            "think": False,
+            "options": options,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        },
+        timeout,
+        iter_ollama_ndjson,
+        ollama_event_content,
+    )
+
+
+def call_openai_stream(base_url, model, prompt, options, timeout, api_key):
+    return _stream_request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        {
+            "model": model,
+            "temperature": options.get("temperature", 0.2),
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        },
+        timeout,
+        iter_openai_sse,
+        openai_event_content,
+        api_key=api_key,
+    )
+
+
+def save_partial_response(response, output):
+    """Save interrupted output separately without touching the requested file."""
+    output = pathlib.Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_suffix(output.suffix + ".partial")
+    partial.write_text(response)
+    return partial
 
 
 def strip_thinking(text):
@@ -247,6 +395,8 @@ def main():
     ap.add_argument("--model", help="override configured model")
     ap.add_argument("--url", help="override backend base URL")
     ap.add_argument("--api", choices=["ollama", "openai"], help="override backend API type")
+    ap.add_argument("--stream", action="store_true",
+                    help="print generated content to stderr as it arrives")
     ap.add_argument("--lang", choices=sorted(LANGUAGE_ALIASES),
                     help="validation language (auto-detected from --out)")
     ap.add_argument("--expect", metavar="PATTERN",
@@ -285,12 +435,23 @@ def main():
         prompt = build_prompt(pathlib.Path(args.task),
                               [pathlib.Path(p) for p in args.context], args.out)
         api_key = os.environ.get("GEMMA_CODER_API_KEY") or cfg.get("api_key")
-        if api == "ollama":
+        if args.stream and api == "ollama":
+            response, _meta = call_ollama_stream(
+                base_url, model, prompt, options, args.timeout)
+        elif args.stream:
+            response, _meta = call_openai_stream(
+                base_url, model, prompt, options, args.timeout, api_key)
+        elif api == "ollama":
             response = call_ollama(base_url, model, prompt, options, args.timeout)
         else:
             response = call_openai(base_url, model, prompt, options, args.timeout, api_key)
-    except (OSError, ValueError, json.JSONDecodeError, KeyError,
-            urllib.error.URLError) as exc:
+    except StreamInterrupted as exc:
+        partial = save_partial_response(exc.partial, pathlib.Path(args.out))
+        print("[gemma-coder] interrupted; partial response saved to %s" % partial,
+              file=sys.stderr)
+        return 4
+    except (BackendError, OSError, TimeoutError, ValueError, json.JSONDecodeError,
+            KeyError, urllib.error.URLError) as exc:
         print("[gemma-coder] request failed: %s" % exc, file=sys.stderr)
         return 2
 

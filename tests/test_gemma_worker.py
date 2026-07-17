@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import os
 import pathlib
 import subprocess
@@ -57,6 +59,68 @@ class ValidationTests(unittest.TestCase):
     def test_invalid_expect_pattern_is_reported_before_write(self):
         with self.assertRaisesRegex(ValueError, "invalid --expect regex"):
             worker.compile_expect_pattern("[")
+
+
+class StreamingProtocolTests(unittest.TestCase):
+    def test_ollama_ndjson_parser_reads_each_json_line(self):
+        lines = [
+            b'{"message":{"content":"```python\\n"},"done":false}\n',
+            b'{"message":{"content":"x = 1\\n```"},"done":false}\n',
+            b'{"done":true,"eval_count":5,"eval_duration":1000000000}\n',
+        ]
+        events = list(worker.iter_ollama_ndjson(lines))
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0]["message"]["content"], "```python\n")
+        self.assertTrue(events[-1]["done"])
+
+    def test_openai_sse_parser_reads_data_and_stops_at_done(self):
+        lines = [
+            b': keepalive\n',
+            b'data: {"choices":[{"delta":{"content":"x"}}]}\n',
+            b'\n',
+            b'data: [DONE]\n',
+            b'data: {"ignored":true}\n',
+        ]
+        events = list(worker.iter_openai_sse(lines))
+        self.assertEqual(events, [{"choices": [{"delta": {"content": "x"}}]}])
+
+    def test_openai_sse_parser_supports_multiline_data_events(self):
+        lines = [
+            b'event: message\n',
+            b'data: {"choices":[\n',
+            b'data: {"delta":{"content":"x"}}]}\n',
+            b'\n',
+        ]
+        events = list(worker.iter_openai_sse(lines))
+        self.assertEqual(events, [{"choices": [{"delta": {"content": "x"}}]}])
+
+    def test_provider_errors_are_backend_errors(self):
+        with self.assertRaisesRegex(worker.BackendError, "model not found"):
+            worker.ollama_event_content({"error": "model not found"})
+        with self.assertRaisesRegex(worker.BackendError, "provider failed"):
+            worker.openai_event_content({"error": {"message": "provider failed"}})
+
+    def test_empty_openai_choices_are_ignored(self):
+        self.assertEqual(worker.openai_event_content({"choices": []}), "")
+
+    def test_interrupt_preserves_only_chunks_seen_before_interrupt(self):
+        def events():
+            yield {"message": {"content": "before"}}
+            raise KeyboardInterrupt()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(worker.StreamInterrupted) as caught:
+                worker.collect_stream(events(), worker.ollama_event_content)
+        self.assertEqual(caught.exception.partial, "before")
+
+    def test_interrupted_response_is_saved_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "module.py"
+            output.write_text("ORIGINAL\n")
+            partial = worker.save_partial_response("```python\nx =", output)
+            self.assertEqual(output.read_text(), "ORIGINAL\n")
+            self.assertEqual(partial.read_text(), "```python\nx =")
+            self.assertEqual(partial.name, "module.py.partial")
 
 
 class AtomicWriteTests(unittest.TestCase):
