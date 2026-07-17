@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 WORKER = pathlib.Path(__file__).resolve().parent / "gemma_worker.py"
+WORKER_SHUTDOWN_GRACE = 30
 
 
 @dataclasses.dataclass(frozen=True)
@@ -188,15 +189,18 @@ def make_subprocess_runner(worker_args, timeout):
                     retry_spec = pathlib.Path(handle.name)
                     selected_spec = retry_spec
             command = [sys.executable, str(WORKER), "--task", str(selected_spec),
-                       "--out", str(output)] + list(worker_args)
+                       "--out", str(output), "--timeout", str(timeout)] + list(worker_args)
             if context:
                 command += ["--context"] + [str(path) for path in context]
             try:
                 proc = subprocess.run(
-                    command, capture_output=True, text=True, timeout=timeout)
+                    command, capture_output=True, text=True,
+                    timeout=timeout + WORKER_SHUTDOWN_GRACE)
                 return AttemptResult(proc.returncode, proc.stderr)
             except subprocess.TimeoutExpired as exc:
-                return AttemptResult(2, "worker timed out after %ss: %s" % (timeout, exc))
+                return AttemptResult(
+                    2, "worker did not exit within %ss after its %ss request timeout: %s"
+                    % (WORKER_SHUTDOWN_GRACE, timeout, exc))
         finally:
             if retry_spec is not None:
                 retry_spec.unlink(missing_ok=True)
