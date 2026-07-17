@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 BATCH_PATH = pathlib.Path(__file__).parents[1] / "scripts" / "gemma_batch.py"
@@ -202,7 +203,24 @@ class ExecutionTests(unittest.TestCase):
 
         batch.execute_batch(batch.parse_manifest(manifest), tasks_dir, root, runner, retries=0)
         self.assertEqual(contexts["types"], [])
-        self.assertEqual(contexts["app"], [root / "src/types.py"])
+        self.assertEqual(contexts["app"], [root.resolve() / "src/types.py"])
+
+
+class SubprocessRunnerTests(unittest.TestCase):
+    def test_worker_timeout_precedes_subprocess_kill(self):
+        runner = batch.make_subprocess_runner(["--stream"], timeout=600)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                batch.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            root = pathlib.Path(directory)
+            spec = root / "task.md"
+            spec.write_text("task")
+            runner(None, spec, root / "out.py", [], None)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--timeout") + 1], "600")
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], 600 + batch.WORKER_SHUTDOWN_GRACE)
 
 
 class CliTests(unittest.TestCase):
