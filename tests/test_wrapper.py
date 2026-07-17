@@ -26,6 +26,16 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("--task", result.stdout)
 
+    def test_wrapper_rejects_symlink_cycles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            link = pathlib.Path(directory) / "gemma-coder"
+            link.symlink_to(link.name)
+            result = subprocess.run(
+                ["sh", "-c", '. "$1"', str(link), str(WRAPPER)],
+                capture_output=True, text=True, timeout=2)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("symlink resolution exceeded 40 hops", result.stderr)
+
     def test_batch_subcommand_reaches_batch_help(self):
         result = subprocess.run([str(WRAPPER), "batch", "--help"],
                                 capture_output=True, text=True)

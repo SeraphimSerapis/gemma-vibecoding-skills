@@ -3,7 +3,13 @@
 set -eu
 
 SOURCE=$0
+SYMLINK_HOPS=0
 while [ -h "$SOURCE" ]; do
+  SYMLINK_HOPS=$((SYMLINK_HOPS + 1))
+  if [ "$SYMLINK_HOPS" -gt 40 ]; then
+    echo "gemma-coder: symlink resolution exceeded 40 hops" >&2
+    exit 2
+  fi
   LINK_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
   TARGET=$(readlink "$SOURCE")
   case "$TARGET" in
