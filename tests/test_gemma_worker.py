@@ -122,6 +122,21 @@ class StreamingProtocolTests(unittest.TestCase):
                 worker.collect_stream(events(), worker.ollama_event_content)
         self.assertEqual(caught.exception.partial, "before")
 
+    def test_ollama_stream_reports_final_stats(self):
+        final_event = {
+            "done": True,
+            "eval_count": 5,
+            "eval_duration": 1_000_000_000,
+            "total_duration": 2_000_000_000,
+        }
+        with mock.patch.object(
+                worker, "_stream_request", return_value=("code", final_event)), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = worker.call_ollama_stream(
+                "http://localhost", "gemma", "prompt", {}, 30)
+        self.assertEqual(result, ("code", final_event))
+        self.assertIn("5 tokens, 5.0 tok/s, 2.0s total", stderr.getvalue())
+
     def test_interrupted_response_is_saved_separately(self):
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "module.py"
