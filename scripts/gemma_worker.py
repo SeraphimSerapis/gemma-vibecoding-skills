@@ -47,9 +47,12 @@ def build_prompt(task_path, context_paths, out_path):
     return "\n".join(parts)
 
 
-def post_json(url, payload, timeout):
+def post_json(url, payload, timeout, api_key=None):
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
@@ -74,7 +77,7 @@ def call_ollama(base_url, model, prompt, options, timeout):
     return data["message"]["content"]
 
 
-def call_openai(base_url, model, prompt, options, timeout):
+def call_openai(base_url, model, prompt, options, timeout, api_key=None):
     data = post_json(base_url.rstrip("/") + "/v1/chat/completions", {
         "model": model,
         "temperature": options.get("temperature", 0.2),
@@ -82,7 +85,7 @@ def call_openai(base_url, model, prompt, options, timeout):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-    }, timeout)
+    }, timeout, api_key)
     return data["choices"][0]["message"]["content"]
 
 
@@ -127,10 +130,12 @@ def main():
           % (model, api, args.task, len(prompt)), file=sys.stderr)
 
     try:
+        api_key = os.environ.get("GEMMA_CODER_API_KEY") or cfg.get("api_key")
         if api == "ollama":
             response = call_ollama(base_url, model, prompt, options, args.timeout)
         else:
-            response = call_openai(base_url, model, prompt, options, args.timeout)
+            response = call_openai(base_url, model, prompt, options, args.timeout,
+                                   api_key)
     except urllib.error.URLError as e:
         print("[gemma-coder] cannot reach %s (%s). Is the server running? "
               "Re-run setup.py to reconfigure." % (base_url, e), file=sys.stderr)

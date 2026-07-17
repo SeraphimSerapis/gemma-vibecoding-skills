@@ -120,26 +120,60 @@ are plain CLIs.
 
 ---
 
-## Getting models: ollama library, Hugging Face, or neither
+## Getting models
 
-**ollama library** (simplest):
+Models can come from the **ollama library** or from **Hugging Face** — both are fully
+supported. Pick whichever option below fits your setup.
+
+### Option A — ollama library (simplest)
+
 ```sh
 ollama pull gemma4            # or gemma4:26b-nvfp4, qwen3.6:35b-a3b, ...
+python3 scripts/setup.py      # pick it, done
 ```
 
-**Hugging Face — yes, fully supported.** Any GGUF repo on the Hub can be pulled
-straight into ollama without waiting for a library release:
+### Option B — Hugging Face model, served by ollama
+
+Any GGUF repo on the Hub works directly — no conversion, no waiting for an ollama
+library release:
+
+1. Find a GGUF build on [huggingface.co](https://huggingface.co/models?library=gguf)
+   (for coding: `unsloth/...-GGUF` and `bartowski/...-GGUF` repos are reliable).
+2. Pull it with the `hf.co/` prefix and a quant tag:
+   ```sh
+   ollama pull hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL
+   ollama pull hf.co/unsloth/gemma-4-27b-it-GGUF:Q4_K_M
+   ```
+3. Re-run `python3 scripts/setup.py` — the HF model appears in the list like any
+   other; pick it and it becomes your coder.
+
+### Option C — Hugging Face model, no ollama at all
+
+- **LM Studio**: use its built-in search (it downloads from the Hub), load the model,
+  enable the local server → run `setup.py`, it's detected on port 1234.
+- **llama.cpp**: `llama-server -hf unsloth/gemma-4-27b-it-GGUF:Q4_K_M` downloads from
+  the Hub and serves it → detected on port 8080.
+- **mlx_lm** (Apple Silicon): `mlx_lm.server --model mlx-community/gemma-4-27b-it-4bit`
+  pulls an MLX build from the Hub → detected on port 8080.
+
+### Option D — Hugging Face hosted inference (not local, not free)
+
+If your machine can't run a good model, the worker also speaks to any hosted
+OpenAI-compatible endpoint, including HF Inference Providers. Set an API key and
+point the config at the router:
+
 ```sh
-ollama run hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL
-ollama run hf.co/unsloth/gemma-4-27b-it-GGUF:Q4_K_M
+export GEMMA_CODER_API_KEY=hf_...     # or put "api_key" in the config file
+python3 scripts/setup.py --save "Qwen/Qwen3.6-35B-A3B" \
+    --url https://router.huggingface.co --api openai
 ```
-The model then shows up in `setup.py --list` like any other. Hugging Face is also the
-model source for the no-ollama runtimes: LM Studio's built-in search downloads from
-the Hub, `llama-server` takes any downloaded `.gguf` file (`-hf user/repo` flag
-downloads directly), and `mlx_lm.server --model mlx-community/...` pulls MLX builds
-from the Hub. **Note:** plain safetensors repos (e.g. NVFP4/TensorRT builds) are for
-GPU inference stacks like vLLM — for this skill, pick GGUF (ollama / llama.cpp /
-LM Studio) or MLX (Apple Silicon) builds.
+
+This trades "free and private" for "no hardware requirements" — your specs and
+context files are sent to the provider.
+
+**Picking the right file type:** choose **GGUF** builds for ollama / llama.cpp /
+LM Studio, **MLX** builds for `mlx_lm`. Plain safetensors repos (e.g. NVFP4/TensorRT
+builds) are for GPU serving stacks like vLLM and won't load in these runtimes.
 
 **Model recommendations** (tested on a 24 GB Apple Silicon Mac):
 - `gemma4:26b-nvfp4` — best quality/speed balance, ~45 tok/s, needs ~17 GB free
@@ -170,6 +204,9 @@ exact signatures, behavior, edge cases. See `SKILL.md` for what makes a good spe
   "num_ctx": 16384
 }
 ```
+
+Optional: `"api_key"` (or env var `$GEMMA_CODER_API_KEY`) — sent as a Bearer token on
+OpenAI-compatible endpoints; only needed for hosted providers, never for local servers.
 
 ## Troubleshooting
 
