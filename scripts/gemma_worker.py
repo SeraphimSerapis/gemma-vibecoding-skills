@@ -179,7 +179,10 @@ def validate_code(code, language, filename="generated"):
             return ValidationResult("failed", "%s: %s" % (exc.msg, exc.text or ""))
         return ValidationResult("passed")
     if language == "javascript":
-        return _validate_with_file(code, ".js", lambda path: ["node", "--check", path])
+        suffix = pathlib.Path(filename).suffix.lower()
+        if suffix not in {".js", ".mjs", ".cjs"}:
+            suffix = ".js"
+        return _validate_with_file(code, suffix, lambda path: ["node", "--check", path])
     if language == "bash":
         return _validate_with_file(code, ".sh", lambda path: ["bash", "-n", path])
     return ValidationResult("skipped", "no validator configured for %s" % language)
@@ -204,6 +207,10 @@ def validate_and_write(code, output, language, expect_pattern, make_backup=True,
     if make_backup and backup.exists() and not stat.S_ISREG(backup.lstat().st_mode):
         raise ValueError("backup path must be a regular file: %s" % backup)
 
+    if output.is_symlink():
+        raise ValueError("output path must not be a symlink: %s" % output)
+    if output.exists() and not stat.S_ISREG(output.lstat().st_mode):
+        raise ValueError("output path must be a regular file: %s" % output)
     existing_mode = stat.S_IMODE(output.stat().st_mode) if output.exists() else None
     temp_path = None
     backup_temp = None
@@ -297,11 +304,19 @@ def main():
     code = extract_code(strip_thinking(response), language)
     if code is None:
         print("[gemma-coder] ERROR: no acceptable code block in response", file=sys.stderr)
+        preview = response[:2000]
+        print("[gemma-coder] raw response:\n%s%s"
+              % (preview, "\n[truncated]" if len(response) > len(preview) else ""),
+              file=sys.stderr)
         return 1
 
-    result = validate_and_write(
-        code, pathlib.Path(args.out), language, expect_pattern,
-        make_backup=not args.no_backup, validate=not args.no_validate)
+    try:
+        result = validate_and_write(
+            code, pathlib.Path(args.out), language, expect_pattern,
+            make_backup=not args.no_backup, validate=not args.no_validate)
+    except (OSError, ValueError) as exc:
+        print("[gemma-coder] output failed: %s" % exc, file=sys.stderr)
+        return 2
     if result.status == "failed":
         print("[gemma-coder] validation failed: %s" % result.message, file=sys.stderr)
         return 3
