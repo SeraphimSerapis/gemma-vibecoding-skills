@@ -89,6 +89,16 @@ def post_json(url, payload, timeout, api_key=None):
         return json.loads(resp.read())
 
 
+def report_ollama_stats(data):
+    """Print Ollama generation statistics when timing metadata is available."""
+    eval_count = data.get("eval_count", 0)
+    eval_ns = data.get("eval_duration", 0)
+    if eval_ns:
+        print("[gemma-coder] %d tokens, %.1f tok/s, %.1fs total"
+              % (eval_count, eval_count / (eval_ns / 1e9),
+                 data.get("total_duration", 0) / 1e9), file=sys.stderr)
+
+
 def call_ollama(base_url, model, prompt, options, timeout):
     data = post_json(base_url.rstrip("/") + "/api/chat", {
         "model": model,
@@ -100,12 +110,7 @@ def call_ollama(base_url, model, prompt, options, timeout):
             {"role": "user", "content": prompt},
         ],
     }, timeout)
-    eval_count = data.get("eval_count", 0)
-    eval_ns = data.get("eval_duration", 0)
-    if eval_ns:
-        print("[gemma-coder] %d tokens, %.1f tok/s, %.1fs total"
-              % (eval_count, eval_count / (eval_ns / 1e9),
-                 data.get("total_duration", 0) / 1e9), file=sys.stderr)
+    report_ollama_stats(data)
     return data["message"]["content"]
 
 
@@ -210,7 +215,7 @@ def _stream_request(url, payload, timeout, parser, content_from_event, api_key=N
 
 
 def call_ollama_stream(base_url, model, prompt, options, timeout):
-    return _stream_request(
+    result = _stream_request(
         base_url.rstrip("/") + "/api/chat",
         {
             "model": model,
@@ -226,6 +231,8 @@ def call_ollama_stream(base_url, model, prompt, options, timeout):
         iter_ollama_ndjson,
         ollama_event_content,
     )
+    report_ollama_stats(result[1])
+    return result
 
 
 def call_openai_stream(base_url, model, prompt, options, timeout, api_key):
