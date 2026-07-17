@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 
 
@@ -59,6 +60,14 @@ class ValidationTests(unittest.TestCase):
     def test_invalid_expect_pattern_is_reported_before_write(self):
         with self.assertRaisesRegex(ValueError, "invalid --expect regex"):
             worker.compile_expect_pattern("[")
+
+    def test_javascript_validation_preserves_module_suffix(self):
+        for suffix in (".js", ".mjs", ".cjs"):
+            with self.subTest(suffix=suffix), mock.patch.object(
+                    worker, "_validate_with_file",
+                    return_value=worker.ValidationResult("passed")) as validator:
+                worker.validate_code("export default 1\n", "javascript", "module" + suffix)
+                self.assertEqual(validator.call_args.args[1], suffix)
 
 
 class StreamingProtocolTests(unittest.TestCase):
@@ -173,6 +182,29 @@ class AtomicWriteTests(unittest.TestCase):
             self.assertEqual(output.read_text(), "ORIGINAL\n")
             self.assertEqual(victim.read_text(), "SECRET\n")
 
+    def test_output_symlink_is_rejected_without_touching_victim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            victim = root / "victim.py"
+            output = root / "module.py"
+            victim.write_text("SECRET\n")
+            output.symlink_to(victim)
+            with self.assertRaisesRegex(ValueError, "output path must not be a symlink"):
+                worker.validate_and_write(
+                    "x = 1\n", output, "python", None, make_backup=True
+                )
+            self.assertEqual(victim.read_text(), "SECRET\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO support required")
+    def test_non_regular_output_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "module.py"
+            os.mkfifo(output)
+            with self.assertRaisesRegex(ValueError, "output path must be a regular file"):
+                worker.validate_and_write(
+                    "x = 1\n", output, "python", None, make_backup=True
+                )
+
     def test_expect_failure_does_not_replace_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "module.py"
@@ -186,6 +218,40 @@ class AtomicWriteTests(unittest.TestCase):
 
 
 class CliErrorTests(unittest.TestCase):
+    def run_main_with_response(self, response, output_error=None):
+        stderr = io.StringIO()
+        argv = ["gemma_worker.py", "--task", "task.md", "--out", "module.py"]
+        patches = [
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(worker, "load_config", return_value={
+                "model": "gemma", "base_url": "http://localhost", "api": "ollama"}),
+            mock.patch.object(worker, "build_prompt", return_value="prompt"),
+            mock.patch.object(worker, "call_ollama", return_value=response),
+        ]
+        if output_error is not None:
+            patches.append(mock.patch.object(
+                worker, "validate_and_write", side_effect=output_error))
+        with patches[0], patches[1], patches[2], patches[3], redirect_stderr(stderr):
+            if output_error is None:
+                return worker.main(), stderr.getvalue()
+            with patches[4]:
+                return worker.main(), stderr.getvalue()
+
+    def test_output_value_error_exits_two_without_traceback(self):
+        exit_code, stderr = self.run_main_with_response(
+            "```python\nx = 1\n```", ValueError("unsafe output"))
+        self.assertEqual(exit_code, 2)
+        self.assertIn("output failed: unsafe output", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_extraction_failure_includes_truncated_raw_response(self):
+        response = "model explanation " + "x" * 2100
+        exit_code, stderr = self.run_main_with_response(response)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("raw response:\nmodel explanation", stderr)
+        self.assertIn("[truncated]", stderr)
+        self.assertNotIn("x" * 2100, stderr)
+
     def test_malformed_config_exits_two_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
             config = pathlib.Path(directory) / "config.json"
